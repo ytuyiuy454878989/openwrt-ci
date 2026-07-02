@@ -3,7 +3,8 @@ name: IPQ60XX-24.10-6.12-WIFI
 on:
   workflow_dispatch:
   schedule:
-    - cron: 0 19 * * *
+    # 定时使用上海时区时间 19点执行
+    cron: TZ=Asia/Shanghai 0 19 * * *
 
 env:
   REPO_URL: https://github.com/LiBwrt/openwrt-6.x.git
@@ -22,148 +23,181 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Check Server Performance(检查服务器性能)
-      run: |
-        echo "警告⚠"
-        echo "分配的服务器性能有限，若选择的插件过多，务必注意CPU性能！"
-        echo -e "已知CPU型号（降序）：7763，8370C，8272CL，8171M，E5-2673 \n"
-        echo "--------------------------CPU信息--------------------------"
-        echo "CPU物理数量：$(cat /proc/cpuinfo | grep "physical id" | sort | uniq | wc -l)"
-        echo -e "CPU核心信息：$(cat /proc/cpuinfo | grep name | cut -f2 -d: | uniq -c) \n"
-        echo "--------------------------内存信息--------------------------"
-        echo "已安装内存详细信息："
-        echo -e "$(sudo lshw -short -C memory | grep GiB) \n"
-        echo "--------------------------硬盘信息--------------------------"
-        echo "硬盘数量：$(ls /dev/sd* | grep -v [1-9] | wc -l)" && df -hT
+      - name: Check Server Performance(检查服务器性能)
+        run: |
+          echo "警告⚠"
+          echo "分配的服务器性能有限，若选择的插件过多，务必注意CPU性能！"
+          echo -e "已知CPU型号（降序）：7763，8370C，8272CL，8171M，E5-2673 \n"
+          echo "--------------------------CPU信息--------------------------"
+          echo "CPU物理数量：$(cat /proc/cpuinfo | grep "physical id" | sort | uniq | wc -l)"
+          echo -e "CPU核心信息：$(cat /proc/cpuinfo | grep name | cut -f2 -d: | uniq -c) \n"
+          echo "--------------------------内存信息--------------------------"
+          echo "已安装内存详细信息："
+          echo -e "$(sudo lshw -short -C memory | grep GiB) \n"
+          echo "--------------------------硬盘信息--------------------------"
+          echo "硬盘数量：$(ls /dev/sd* | grep -v [0-9] | wc -l)" && df -hT
 
-    - name: Initialization Environment(初始化环境)
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
-        sudo -E apt -yqq install dos2unix
-        sudo -E apt -yqq install libfuse-dev
-        sudo -E apt -yqq autoremove --purge
-        sudo -E apt -yqq autoclean
-        sudo -E apt -yqq clean
-        sudo -E systemctl daemon-reload
-        sudo timedatectl set-timezone "$TZ"        
+      # 磁盘扩容前置，必须在安装依赖前执行
+      - name: Combine Disks(合并磁盘扩容)
+        uses: easimon/maximize-build-space@master
+        with:
+          swap-size-mb: 1024
+          temp-reserve-mb: 100
+          root-reserve-mb: 1024
 
-    - name: Combine Disks(合并磁盘)
-      uses: easimon/maximize-build-space@master
-      with:
-        swap-size-mb: 1024
-        temp-reserve-mb: 100
-        root-reserve-mb: 1024
+      - name: Initialization Environment(初始化编译环境)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo timedatectl set-timezone "$TZ"
+          sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo -E apt -yqq install dos2unix libfuse-dev
+          sudo -E apt -yqq autoremove --purge
+          sudo -E apt -yqq autoclean
+          sudo -E apt -yqq clean
+          sudo -E systemctl daemon-reload
 
-    - name: Checkout
-      uses: actions/checkout@main
+      # 固定稳定v4版本，弃用main分支
+      - name: Checkout Workspace(拉取仓库配置、脚本、config)
+        uses: actions/checkout@v4
 
-    - name: Clone Source Code(克隆源代码)
-      run: |
-        df -hT $GITHUB_WORKSPACE
-        git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
-        cd openwrt
-        echo "OPENWRT_PATH=$PWD" >> $GITHUB_ENV
-        VERSION_INFO=$(git show -s --date=short --format="作者: %an<br/>时间: %cd<br/>内容: %s<br/>hash: %H")
-        echo "VERSION_INFO=$VERSION_INFO" >> $GITHUB_ENV
+      - name: Clone OpenWrt Source Code(克隆源码)
+        run: |
+          df -hT $GITHUB_WORKSPACE
+          git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
+          cd openwrt
+          echo "OPENWRT_PATH=$PWD" >> $GITHUB_ENV
+          VERSION_INFO=$(git show -s --date=short --format="作者: %an<br/>时间: %cd<br/>内容: %s<br/>hash: %H")
+          echo "VERSION_INFO<<EOF" >> $GITHUB_ENV
+          echo "$VERSION_INFO" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
 
-    - name: Generate Variables(生成变量)
-      run: |
-        cp $CONFIG_FILE $OPENWRT_PATH/.config
-        cd $OPENWRT_PATH
-        make defconfig > /dev/null 2>&1
-        SOURCE_REPO="$(echo $REPO_URL | awk -F '/' '{print $(NF)}')"
-        echo "SOURCE_REPO=$SOURCE_REPO" >> $GITHUB_ENV
-        DEVICE_TARGET=$(cat .config | grep CONFIG_TARGET_BOARD | awk -F '"' '{print $2}')
-        echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_ENV
-        DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
-        echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
+      # 复制自定义文件、执行DIY脚本，前置到feed更新前
+      - name: Apply Custom Files & Run DIY Script(自定义补丁/脚本)
+        run: |
+          if [ -d "$GITHUB_WORKSPACE/files" ]; then
+            cp -r "$GITHUB_WORKSPACE/files" "$OPENWRT_PATH/"
+            echo "✅ 已复制自定义files目录"
+          fi
+          if [ -f "$GITHUB_WORKSPACE/$DIY_SCRIPT" ]; then
+            chmod +x "$GITHUB_WORKSPACE/$DIY_SCRIPT"
+            cd "$OPENWRT_PATH"
+            bash "$GITHUB_WORKSPACE/$DIY_SCRIPT"
+            echo "✅ 自定义DIY脚本执行完成"
+          fi
 
-    - name: Cache Toolchain(缓存工具链)
-      if: env.CACHE_TOOLCHAIN == 'true'
-      uses: HiGarfield/cachewrtbuild@main
-      with:
-        ccache: false
-        mixkey: ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}
-        prefix: ${{ env.OPENWRT_PATH }}
-    
-    - name: Install Feeds(安装feeds)
-      run: |
-        cd $OPENWRT_PATH
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
-  
-    - name: Load Custom Configuration(加载自定义配置)
-      run: |
-        [ -e files ] && mv files $OPENWRT_PATH/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE $OPENWRT_PATH/.config
+      - name: Import Config & Generate Target Variables(导入配置生成编译标识)
+        run: |
+          cp "$GITHUB_WORKSPACE/$CONFIG_FILE" "$OPENWRT_PATH/.config"
+          cd "$OPENWRT_PATH"
+          make defconfig > /dev/null 2>&1
+          SOURCE_REPO=$(echo $REPO_URL | awk -F '/' '{print $(NF)}')
+          echo "SOURCE_REPO=$SOURCE_REPO" >> $GITHUB_ENV
+          DEVICE_TARGET=$(grep CONFIG_TARGET_BOARD .config | awk -F '"' '{print $2}')
+          echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_ENV
+          DEVICE_SUBTARGET=$(grep CONFIG_TARGET_SUBTARGET .config | awk -F '"' '{print $2}')
+          echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
 
-    - name: Download DL Package(下载DL软件包)
-      run: |
-        cd $OPENWRT_PATH
-        make defconfig
-        make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+      # 缓存步骤后置，此时TARGET变量已生成，缓存key正常
+      - name: Cache Toolchain(缓存编译工具链)
+        if: env.CACHE_TOOLCHAIN == 'true'
+        uses: HiGarfield/cachewrtbuild@main
+        with:
+          ccache: false
+          mixkey: ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}
+          prefix: ${{ env.OPENWRT_PATH }}
 
-    - name: Compile Firmware(开始编译固件)
-      id: compile
-      run: |
-        cd $OPENWRT_PATH
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
-        echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
-        echo "FILE_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
+      - name: Install Feeds(更新并安装软件源)
+        run: |
+          cd "$OPENWRT_PATH"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig > /dev/null 2>&1
 
-    - name: Check Space Usage(检查空间使用情况)
-      if: (!cancelled())
-      run: df -hT
+      - name: Download All Dependency Packages(预下载源码包)
+        run: |
+          cd "$OPENWRT_PATH"
+          make download -j$(nproc)
+          # 删除空失效下载文件
+          find dl -size -1024c -type f -delete
 
-    - name: Upload Bin Directory(上传固件)
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      uses: actions/upload-artifact@main
-      with:
-        name: ${{ env.SOURCE_REPO }}-bin-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
-        path: ${{ env.OPENWRT_PATH }}/bin
+      - name: Compile Firmware(编译固件)
+        id: compile
+        run: |
+          cd "$OPENWRT_PATH"
+          echo "🚀 使用 $(nproc) 线程编译固件"
+          # 多线程失败自动单线程带完整日志重试
+          if ! make -j$(nproc); then
+            echo "⚠️ 多线程编译失败，切换单线程完整日志重试"
+            make -j1 V=s
+          fi
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
+          echo "FILE_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
 
-    - name: Organize Files(整理文件)
-      if: steps.compile.outputs.status == 'success'
-      run: |
-        cd $OPENWRT_PATH/bin/targets/*/*
-        cat sha256sums
-        cp $OPENWRT_PATH/.config build.config
-        mv -f $OPENWRT_PATH/bin/packages/*/*/*.ipk packages
-        tar -zcf Packages.tar.gz packages
-        rm -rf packages feeds.buildinfo version.buildinfo
-        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+      - name: Check Disk Space After Build(编译后磁盘占用检查)
+        if: (!cancelled())
+        run: df -hT
 
-    - name: Upload Firmware To Artifact(将固件上传到Artifact)
-      if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE != 'true'
-      uses: actions/upload-artifact@main
-      with:
-        name: ${{ env.SOURCE_REPO }}-firmware-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE_PATH }}
+      - name: Upload Full Bin Directory(上传完整bin目录构件)
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SOURCE_REPO }}-bin-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
+          path: ${{ env.OPENWRT_PATH }}/bin
 
-    - name: Upload Firmware To Release(发布固件)
-      if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE == 'true'
-      uses: ncipollo/release-action@v1
-      with:
-        name: R${{ env.DATE }} for ${{ env.FIRMWARE_TAG }}
-        allowUpdates: true
-        tag: ${{ env.FIRMWARE_TAG }}
-        token: ${{ secrets.GITHUB_TOKEN }}
-        artifacts: ${{ env.FIRMWARE_PATH }}/*
-        body: |
-          **This is OpenWrt Firmware for ${{ env.FIRMWARE_TAG }}**
-          ### 📒 固件信息24.10(WIFI)
-          - 带WIFI带有线NSS的6.12内核固件
-          - 💻 这是 ${{ env.FIRMWARE_TAG }} 平台使用的 OpenWrt 固件
-          - ⚽ 固件源码: ${{ env.REPO_URL }}
-          - 💝 源码分支: ${{ env.REPO_BRANCH }}
-          - 🌐 默认地址: 192.168.1.1
-          - 🔑 默认密码: password
-          ### 🧊 固件版本
-          - 固件编译前最后一次➦[主源码](${{ env.REPO_URL }})更新记录
-          - ${{ env.VERSION_INFO }}
+      - name: Sort Firmware Files(整理固件打包文件)
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cd "$OPENWRT_PATH/bin/targets"/*/*
+          echo "===== 固件校验哈希 ====="
+          cat sha256sums
+          # 保存编译配置
+          cp "$OPENWRT_PATH/.config" build.config
+          # 打包全部ipk安装包
+          mkdir -p packages
+          find "$OPENWRT_PATH/bin/packages" -name "*.ipk" -exec cp {} packages/ \;
+          tar -zcf Packages.tar.gz packages
+          # 清理冗余文件减少体积
+          rm -rf packages feeds.buildinfo version.buildinfo
+          echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+
+      - name: Upload Firmware To Artifact(上传固件至工作流构件)
+        if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SOURCE_REPO }}-firmware-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
+          path: |
+            ${{ env.FIRMWARE_PATH }}/*.bin
+            ${{ env.FIRMWARE_PATH }}/*.img
+            ${{ env.FIRMWARE_PATH }}/sha256sums
+            ${{ env.FIRMWARE_PATH }}/build.config
+            ${{ env.FIRMWARE_PATH }}/Packages.tar.gz
+
+      - name: Publish Firmware To GitHub Release(发布正式Release)
+        if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          name: Release ${{ env.DATE }} | ${{ env.FIRMWARE_TAG }}
+          allowUpdates: true
+          tag: ${{ env.FIRMWARE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: |
+            ${{ env.FIRMWARE_PATH }}/*.bin
+            ${{ env.FIRMWARE_PATH }}/*.img
+            ${{ env.FIRMWARE_PATH }}/sha256sums
+            ${{ env.FIRMWARE_PATH }}/build.config
+            ${{ env.FIRMWARE_PATH }}/Packages.tar.gz
+          body: |
+            ## OpenWrt IPQ60XX 24.10 6.12 NSS WIFI 固件
+            - 内核版本：6.12 带NSS加速 + WIFI驱动
+            - 设备平台：${{ env.FIRMWARE_TAG }}
+            - 源码仓库：${{ env.REPO_URL }}
+            - 源码分支：${{ env.REPO_BRANCH }}
+            - 后台地址：192.168.1.1
+            - 默认密码：password
+            -插件
+            -$(grep -oP "luci-app(-[a-zA-Z0-9]{1,}){1,}" ./firmware/*.manifest | awk -F":" '{print $NF}')
+
+            ### 源码提交记录
+            ${{ env.VERSION_INFO }}
