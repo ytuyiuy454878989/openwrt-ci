@@ -108,23 +108,23 @@ jobs:
         find dl -size -1024c -exec rm -f {} \;
 
 
-- name: 释放磁盘空间
-  run: |
-    # 删除预装无用大体积工具
-    sudo rm -rf /usr/share/dotnet
-    sudo rm -rf /usr/local/lib/android
-    sudo rm -rf /opt/ghc
-    sudo rm -rf /opt/hostedtoolcache/CodeQL
-    sudo rm -rf /usr/local/share/powershell
-    sudo rm -rf /usr/local/lib/node_modules
-    # 清理包缓存与Docker镜像
-    sudo apt clean
-    sudo rm -rf /var/lib/apt/lists/*
-    docker system prune -af --volumes || true
+    - name: 释放磁盘空间
+      run: |
+       # 删除预装无用大体积工具
+      sudo rm -rf /usr/share/dotnet
+      sudo rm -rf /usr/local/lib/android
+      sudo rm -rf /opt/ghc
+      sudo rm -rf /opt/hostedtoolcache/CodeQL
+      sudo rm -rf /usr/local/share/powershell
+      sudo rm -rf /usr/local/lib/node_modules
+     # 清理包缓存与Docker镜像
+      sudo apt clean
+      sudo rm -rf /var/lib/apt/lists/*
+      docker system prune -af --volumes || true
     # 打印剩余空间确认
-    df -h
+      df -h
 
-# 后面再接你的编译步骤
+    # 后面再接你的编译步骤
 
 
     - name: Compile Firmware(开始编译固件)
